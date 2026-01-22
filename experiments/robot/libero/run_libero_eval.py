@@ -78,7 +78,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-
 @dataclass
 class GenerateConfig:
     # fmt: off
@@ -89,6 +88,7 @@ class GenerateConfig:
     model_family: str = "openvla"                    # Model family
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
+    use_simple_mlp_head: bool = False                # If True, uses simple MLP action head
     use_minivlm: bool = True                         # If True, uses minivlm
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -124,10 +124,9 @@ class GenerateConfig:
     seed: int = 7                                    # Random Seed (for reproducibility)
 
     # fmt: on
-    save_version: str = "vla-adapter"                # version of 
-    use_pro_version: bool = True                     # encourage to use the pro models we released.
+    save_version: str = "vla-adapter"  # version of
+    use_pro_version: bool = True  # encourage to use the pro models we released.
     phase: str = "Inference"
-
 
 
 def validate_config(cfg: GenerateConfig) -> None:
@@ -142,6 +141,7 @@ def validate_config(cfg: GenerateConfig) -> None:
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
 
+    assert sum([cfg.use_l1_regression, cfg.use_simple_mlp_head]) == 1, "Only one action head can be used at a time!"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -160,7 +160,7 @@ def initialize_model(cfg: GenerateConfig):
 
     # Load action head if needed
     action_head = None
-    if cfg.use_l1_regression:
+    if cfg.use_l1_regression or cfg.use_simple_mlp_head:
         action_head = get_action_head(cfg, model.llm_dim)
 
     # Load noisy action projector if using diffusion
@@ -191,7 +191,6 @@ def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     cfg.unnorm_key = unnorm_key
 
 
-
 def setup_logging(cfg: GenerateConfig):
     """Set up logging to file and optionally to wandb."""
     # Create run ID
@@ -216,14 +215,12 @@ def setup_logging(cfg: GenerateConfig):
     return log_file, local_log_filepath, run_id
 
 
-
 def log_message(message: str, log_file=None):
     """Log a message to console and optionally to a log file."""
     logger.info(message)
     if log_file:
         log_file.write(message + "\n")
         log_file.flush()
-
 
 
 def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
@@ -240,7 +237,6 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
     else:
         log_message("Using default initial states", log_file)
         return initial_states, None
-
 
 
 def prepare_observation(obs, resize_size):
@@ -265,7 +261,6 @@ def prepare_observation(obs, resize_size):
     return observation, img  # Return both processed observation and original image for replay
 
 
-
 def process_action(action, model_family):
     """Process action before sending to environment."""
     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -277,7 +272,6 @@ def process_action(action, model_family):
         action = invert_gripper_action(action)
 
     return action
-
 
 
 def run_episode(
@@ -305,9 +299,11 @@ def run_episode(
 
     # Initialize action queue
     if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
-        print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
-               "{NUM_ACTIONS_CHUNK} constant defined in prismatic.vla.constants! For best performance (in terms of "
-               "both speed and success rate), we recommend executing the full action chunk.")
+        print(
+            f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
+            "{NUM_ACTIONS_CHUNK} constant defined in prismatic.vla.constants! For best performance (in terms of "
+            "both speed and success rate), we recommend executing the full action chunk."
+        )
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
 
     # Setup
@@ -342,15 +338,14 @@ def run_episode(
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
-                    use_minivlm=cfg.use_minivlm
+                    use_minivlm=cfg.use_minivlm,
                 )
 
-                action_queue.extend(actions) 
+                action_queue.extend(actions)
 
             # Get action from queue
             action = action_queue.popleft()
             # action = actions[0]
-
 
             # Process action
             action = process_action(action, cfg.model_family)
@@ -368,8 +363,6 @@ def run_episode(
     return success, replay_images
 
 
-
-
 def run_task(
     cfg: GenerateConfig,
     task_suite,
@@ -383,7 +376,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
-    save_version=None
+    save_version=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -444,7 +437,12 @@ def run_task(
 
         # Save replay video
         save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file, save_version=save_version
+            replay_images,
+            total_episodes,
+            success=success,
+            task_description=task_description,
+            log_file=log_file,
+            save_version=save_version,
         )
 
         # Log results
@@ -458,7 +456,7 @@ def run_task(
 
     log_message(f"Current task success rate: {task_success_rate}", log_file)
     log_message(f"Current total success rate: {total_success_rate}", log_file)
-    
+
     # close env
     env.close()
     del env
@@ -475,7 +473,6 @@ def run_task(
     return total_episodes, total_successes
 
 
-
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
@@ -489,7 +486,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
 
     # for name, param in model.named_parameters():
-    #     if 'action_queries' in name: 
+    #     if 'action_queries' in name:
     #         print(f"{name}: {param}")
 
     # Get expected image dimensions
@@ -521,7 +518,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
-            cfg.save_version
+            cfg.save_version,
         )
 
     # Calculate final success rate
@@ -548,7 +545,6 @@ def eval_libero(cfg: GenerateConfig) -> float:
         log_file.close()
 
     return final_success_rate
-
 
 
 if __name__ == "__main__":

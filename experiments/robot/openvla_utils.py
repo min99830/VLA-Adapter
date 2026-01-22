@@ -16,21 +16,26 @@ import tensorflow as tf
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+from transformers import (
+    AutoConfig,
+    AutoImageProcessor,
+    AutoModelForVision2Seq,
+    AutoProcessor,
+)
 
 # Apply JSON numpy patch for serialization
 json_numpy.patch()
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import L1RegressionActionHead
+from prismatic.extern.hf.processing_prismatic import (
+    PrismaticImageProcessor,
+    PrismaticProcessor,
+)
+from prismatic.models.action_heads import L1RegressionActionHead, SimpleMLPActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
-from prismatic.vla.constants import (
-    ACTION_DIM,
-    ACTION_PROPRIO_NORMALIZATION_TYPE,
-)
+from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
 # Initialize important constants
@@ -220,9 +225,9 @@ def find_checkpoint_file(pretrained_checkpoint: str, file_pattern: str) -> str:
             full_path = os.path.join(pretrained_checkpoint, filename)
             checkpoint_files.append(full_path)
 
-    assert len(checkpoint_files) == 1, (
-        f"Expected exactly 1 {file_pattern} checkpoint but found {len(checkpoint_files)} in directory: {pretrained_checkpoint}"
-    )
+    assert (
+        len(checkpoint_files) == 1
+    ), f"Expected exactly 1 {file_pattern} checkpoint but found {len(checkpoint_files)} in directory: {pretrained_checkpoint}"
 
     return checkpoint_files[0]
 
@@ -248,6 +253,7 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
             new_state_dict[k] = v
 
     return new_state_dict
+
 
 def load_component_state_dict_v1(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     """
@@ -352,7 +358,8 @@ def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
 
     # Create and apply FiLMed vision backbone
     new_vision_backbone = FiLMedPrismaticVisionBackbone(
-        vision_backbone=vla.vision_backbone, llm_dim=vla.llm_dim,
+        vision_backbone=vla.vision_backbone,
+        llm_dim=vla.llm_dim,
     )
     vla.model.vision_backbone = new_vision_backbone
 
@@ -503,14 +510,20 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead]:
     # Initialize appropriate action head based on configuration
     if cfg.use_l1_regression:
         action_head = L1RegressionActionHead(
-            input_dim=llm_dim, 
-            hidden_dim=llm_dim, 
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
             action_dim=ACTION_DIM,
             use_pro_version=cfg.use_pro_version,
         )
+    elif cfg.use_simple_mlp_head:
+        action_head = SimpleMLPActionHead(
+            input_dim=llm_dim,
+            hidden_dim=llm_dim,
+            action_dim=ACTION_DIM,
+        )
 
     else:
-        raise ValueError("Either use_l1_regression or use_diffusion must be True")
+        raise ValueError("Either use_l1_regression or use_simple_mlp_head must be True")
 
     action_head = action_head.to(torch.bfloat16).to(DEVICE)
     action_head.eval()
@@ -532,7 +545,8 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead]:
         state_dict = load_component_state_dict(action_head_path)
         action_head.load_state_dict(state_dict)
     else:
-        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
+        file_pattern = "action_head_simple" if cfg.use_simple_mlp_head else "action_head"
+        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, file_pattern)
         state_dict = load_component_state_dict(checkpoint_path)
         action_head.load_state_dict(state_dict)
 
@@ -780,7 +794,7 @@ def get_vla_action(
         if not use_minivlm:
             prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
         else:
-            prompt = f'<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat action should the robot take to {task_label.lower()}?<|im_end|>\n<|im_start|>assistant\n'
+            prompt = f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat action should the robot take to {task_label.lower()}?<|im_end|>\n<|im_start|>assistant\n"
 
         # Process primary image
         inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
@@ -803,7 +817,6 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
-        
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
