@@ -6,8 +6,12 @@ Fine-tunes Qwen2.5-0.5B via LoRA.
 
 import os
 import time
+import warnings
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
+
+warnings.filterwarnings("ignore", message="Length of IterableDataset")
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
 
@@ -186,6 +190,7 @@ def get_run_id(cfg) -> str:
             f"{cfg.config_file_path.split('/')[-1]}+{cfg.dataset_name}"
             f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
             f"+lr-{cfg.learning_rate}"
+            f"--{datetime.now().strftime('%Y_%m_%d-%H_%M_%S')}"
         )
         if cfg.use_fz:
             run_id += f"+frozen+dropout-{cfg.lora_dropout}"
@@ -498,6 +503,7 @@ def save_training_checkpoint(
     train_dataset,
     distributed_state,
     new_state_dict,
+    metrics=None,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -518,11 +524,12 @@ def save_training_checkpoint(
         None.
     """
     # Determine checkpoint paths and naming
+    loss_val = metrics.get("loss_value", 0.0) if metrics else 0.0
     if cfg.save_latest_checkpoint_only:
         checkpoint_dir = run_dir
         checkpoint_name_suffix = "latest_checkpoint.pt"
     else:
-        checkpoint_dir = Path(str(run_dir) + f"--{log_step}_chkpt")
+        checkpoint_dir = run_dir / f"{log_step}_chkpt-{loss_val:.4f}"
         checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
 
     adapter_dir = checkpoint_dir / "lora_adapter"
@@ -727,7 +734,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", mode="offline")
+        wandb.init(project=cfg.wandb_project, name=run_id, id=run_id, resume="allow", mode="offline")
 
     # Print detected constants
     print(
@@ -1101,22 +1108,22 @@ def finetune(cfg: FinetuneConfig) -> None:
                 optimizer.zero_grad()
                 progress.update()
 
-            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                save_training_checkpoint(
-                    cfg=cfg,
-                    run_dir=run_dir,
-                    log_step=log_step,
-                    vla=vla,
-                    processor=processor,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    noisy_action_projector=None,
-                    action_head=action_head,
-                    train_dataset=train_dataset,
-                    distributed_state=distributed_state,
-                    new_state_dict=RAW_STATE_DICT,
-                )
-
+                # Save model checkpoint: either keep latest checkpoint only or all checkpoints
+                if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+                    save_training_checkpoint(
+                        cfg=cfg,
+                        run_dir=run_dir,
+                        log_step=log_step,
+                        vla=vla,
+                        processor=processor,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        noisy_action_projector=None,
+                        action_head=action_head,
+                        train_dataset=train_dataset,
+                        distributed_state=distributed_state,
+                        new_state_dict=RAW_STATE_DICT,
+                        metrics=metrics,
+                    )
             # Test model on validation set
             if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
                 run_validation(

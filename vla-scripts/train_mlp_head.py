@@ -1,8 +1,12 @@
 import logging
 import os
 import time
+import warnings
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
+
+warnings.filterwarnings("ignore", message="Length of IterableDataset")
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
 
@@ -88,7 +92,7 @@ class TrainConfig:
     use_film: bool = False
     use_simple_mlp_head: bool = True
 
-    batch_size: int = 8
+    batch_size: int = 4
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 0.1
     num_steps_before_decay: int = 100000
@@ -110,6 +114,8 @@ class TrainConfig:
     save_latest_checkpoint_only: bool = False
     resume: bool = False
     resume_step: Optional[int] = None
+    run_id_note: Optional[str] = None
+    run_id_override: Optional[str] = None
 
 
 def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
@@ -311,6 +317,7 @@ def save_training_checkpoint(
     train_dataset,
     distributed_state,
     new_state_dict,
+    metrics=None,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -331,11 +338,12 @@ def save_training_checkpoint(
         None.
     """
     # Determine checkpoint paths and naming
+    loss_val = metrics.get("loss_value", 0.0) if metrics else 0.0
     if cfg.save_latest_checkpoint_only:
         checkpoint_dir = run_dir
         checkpoint_name_suffix = "latest_checkpoint.pt"
     else:
-        checkpoint_dir = Path(str(run_dir) + f"--{log_step}_chkpt")
+        checkpoint_dir = run_dir / f"{log_step}_chkpt-{loss_val:.4f}"
         checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
 
     adapter_dir = checkpoint_dir / "lora_adapter"
@@ -375,7 +383,7 @@ def save_training_checkpoint(
         config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
         base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)
 
-        new_state_dict["action_queries.weight"] = vla.state_dict()["module.base_model.action_queries.weight"]
+        new_state_dict["action_queries.weight"] = vla.state_dict()["module.action_queries.weight"]
         missing_keys, unexpected_keys = base_vla.load_state_dict(new_state_dict, strict=False)
 
         base_vla.save_pretrained(checkpoint_dir)
@@ -465,17 +473,35 @@ def run_validation(
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
 
 
+def get_run_id(cfg) -> str:
+    if cfg.run_id_override is not None:
+        run_id = cfg.run_id_override
+    elif cfg.resume:
+        run_id = cfg.config_file_path.split("/")[-1]
+        if "chkpt" in run_id.split("--")[-1]:
+            run_id = "--".join(run_id.split("--")[:-1])
+    else:
+        run_id = (
+            f"{cfg.config_file_path.split('/')[-1]}+{cfg.dataset_name}"
+            f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
+            f"+lr-{cfg.learning_rate}"
+            f"+mlp-head"
+            f"--{datetime.now().strftime('%Y_%m_%d-%H_%M_%S')}"
+        )
+        if cfg.image_aug:
+            run_id += "--image_aug"
+        if cfg.run_id_note is not None:
+            run_id += f"--{cfg.run_id_note}"
+    return run_id
+
+
 @draccus.wrap()
 def train(cfg: TrainConfig):
 
     cfg.config_file_path = cfg.config_file_path.rstrip("/")
     LOGGER.info(f"Train MLP-head with OpenVLA Model `{cfg.config_file_path}` on `{cfg.dataset_name}`")
 
-    run_id = (
-        f"{cfg.config_file_path.split('/')[-1]}+{cfg.dataset_name}"
-        f"+b{cfg.batch_size * cfg.grad_accumulation_steps}+lr{cfg.learning_rate}"
-        f"+mlp-head"
-    )
+    run_id = get_run_id(cfg)
 
     run_dir = cfg.run_root_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -490,7 +516,7 @@ def train(cfg: TrainConfig):
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=f"train+{run_id}", mode="offline")
+        wandb.init(project=cfg.wandb_project, name=run_id, id=run_id, resume="allow", mode="offline")
 
     LOGGER.info(
         "Detected constants:\n"
@@ -509,6 +535,9 @@ def train(cfg: TrainConfig):
     if distributed_state.is_main_process:
         update_auto_map(cfg.config_file_path)
         check_model_logic_mismatch(cfg.config_file_path)
+
+    # Wait for model files to be synced
+    dist.barrier()
 
     # Load Processor and VLA
     processor = AutoProcessor.from_pretrained(cfg.config_file_path, trust_remote_code=True)
@@ -729,40 +758,41 @@ def train(cfg: TrainConfig):
                 optimizer.zero_grad()
                 progress.update()
 
-            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                save_training_checkpoint(
-                    cfg=cfg,
-                    run_dir=run_dir,
-                    log_step=log_step,
-                    vla=vla,
-                    processor=processor,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    noisy_action_projector=None,
-                    action_head=action_head,
-                    train_dataset=train_dataset,
-                    distributed_state=distributed_state,
-                    new_state_dict=RAW_STATE_DICT,
-                )
+                # Save model checkpoint: either keep latest checkpoint only or all checkpoints
+                if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+                    save_training_checkpoint(
+                        cfg=cfg,
+                        run_dir=run_dir,
+                        log_step=log_step,
+                        vla=vla,
+                        processor=processor,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        noisy_action_projector=None,
+                        action_head=action_head,
+                        train_dataset=train_dataset,
+                        distributed_state=distributed_state,
+                        new_state_dict=RAW_STATE_DICT,
+                        metrics=metrics,
+                    )
 
-            # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
-                run_validation(
-                    vla=vla,
-                    action_head=action_head,
-                    noisy_action_projector=None,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    val_dataloader=val_dataloader,
-                    action_tokenizer=action_tokenizer,
-                    device_id=device_id,
-                    cfg=cfg,
-                    num_patches=NUM_PATCHES,
-                    log_step=log_step,
-                    distributed_state=distributed_state,
-                    val_time_limit=cfg.val_time_limit,
-                )
-                # Set model back to training mode after validation
-                vla.train()
+                # Test model on validation set
+                if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+                    run_validation(
+                        vla=vla,
+                        action_head=action_head,
+                        noisy_action_projector=None,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        val_dataloader=val_dataloader,
+                        action_tokenizer=action_tokenizer,
+                        device_id=device_id,
+                        cfg=cfg,
+                        num_patches=NUM_PATCHES,
+                        log_step=log_step,
+                        distributed_state=distributed_state,
+                        val_time_limit=cfg.val_time_limit,
+                    )
+                    # Set model back to training mode after validation
+                    vla.train()
 
             # Stop training when max_steps is reached
             if log_step == cfg.max_steps:
