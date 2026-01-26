@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
+from datetime import datetime
 
 import draccus
 import numpy as np
@@ -48,6 +49,7 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
+from utils.feature_io import save_eval_features
 
 
 # Define task suite constants
@@ -127,6 +129,7 @@ class GenerateConfig:
     save_version: str = "vla-adapter"  # version of
     use_pro_version: bool = True  # encourage to use the pro models we released.
     phase: str = "Inference"
+    save_features: bool = False                      # Whether to save hidden states features
 
 
 def validate_config(cfg: GenerateConfig) -> None:
@@ -324,6 +327,14 @@ def run_episode(
     t = 0
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    
+    # Feature storage
+    episode_features = {
+        "observations": [],
+        "predicted_actions": [],
+        "hidden_states": [],
+        "steps": []
+    }
 
     # Run episode
     success = False
@@ -342,7 +353,7 @@ def run_episode(
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 # Query model to get action
-                actions = get_action(
+                actions, hidden_states = get_action(
                     cfg,
                     model,
                     observation,
@@ -354,6 +365,12 @@ def run_episode(
                     use_film=cfg.use_film,
                     use_minivlm=cfg.use_minivlm,
                 )
+
+                if cfg.save_features and hidden_states is not None:
+                    episode_features["observations"].append(observation)
+                    episode_features["predicted_actions"].append(actions)
+                    episode_features["hidden_states"].append(hidden_states)
+                    episode_features["steps"].append(t)
 
                 action_queue.extend(actions)
 
@@ -370,6 +387,15 @@ def run_episode(
                 success = True
                 break
             t += 1
+        
+        if cfg.save_features and len(episode_features["steps"]) > 0:
+            save_eval_features(
+                local_log_dir=cfg.local_log_dir,
+                task_suite_name=cfg.task_suite_name,
+                task_description=task_description,
+                episode_features=episode_features,
+                success=success
+            )
 
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)

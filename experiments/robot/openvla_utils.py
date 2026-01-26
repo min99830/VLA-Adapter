@@ -759,7 +759,7 @@ def get_vla_action(
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
     use_minivlm: bool = False,
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
     """
     Generate action predictions with the VLA policy.
 
@@ -775,7 +775,7 @@ def get_vla_action(
         use_film: Whether to use FiLM
 
     Returns:
-        List[np.ndarray]: Predicted actions
+        Tuple[List[np.ndarray], Optional[np.ndarray]]: Predicted actions and hidden states
     """
     with torch.inference_mode():
 
@@ -820,10 +820,10 @@ def get_vla_action(
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, hidden_states = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
         else:
             # Custom action head for continuous actions
-            action, _ = vla.predict_action(
+            action, hidden_states = vla.predict_action(
                 **inputs,
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
@@ -835,7 +835,7 @@ def get_vla_action(
             )
 
     # Extract subset of actions for open loop steps
-    return [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]
+    return [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))], hidden_states.cpu().float().numpy()
 
 
 def get_action_from_server(

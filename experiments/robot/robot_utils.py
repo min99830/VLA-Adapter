@@ -3,7 +3,7 @@
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -107,7 +107,7 @@ def get_action(
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
     use_minivlm: bool = False,
-) -> Union[List[np.ndarray], np.ndarray]:
+) -> Tuple[Union[List[np.ndarray], np.ndarray], Optional[np.ndarray]]:
     """
     Query the model to get action predictions.
 
@@ -123,14 +123,14 @@ def get_action(
         use_film: Whether to use FiLM
 
     Returns:
-        Union[List[np.ndarray], np.ndarray]: Predicted actions
+        Tuple[Union[List[np.ndarray], np.ndarray], Optional[np.ndarray]]: Predicted actions and hidden states
 
     Raises:
         ValueError: If model family is not supported
     """
     with torch.no_grad():
         if cfg.model_family == "openvla":
-            action = get_vla_action(
+            action, hidden_states = get_vla_action(
                 cfg=cfg,
                 vla=model,
                 processor=processor,
@@ -145,7 +145,7 @@ def get_action(
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")
 
-    return action
+    return action, hidden_states
 
 
 def normalize_gripper_action(action: np.ndarray, binarize: bool = True) -> np.ndarray:
