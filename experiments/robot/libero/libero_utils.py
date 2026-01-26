@@ -9,10 +9,7 @@ import tensorflow as tf
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-from experiments.robot.robot_utils import (
-    DATE,
-    DATE_TIME,
-)
+from experiments.robot.robot_utils import DATE, DATE_TIME
 
 
 def get_libero_env(task, model_family, resolution=256):
@@ -46,10 +43,10 @@ def get_libero_wrist_image(obs):
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, save_version=None):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{save_version}/{DATE}"
+    rollout_dir = f"./rollouts/{save_version}/{DATE_TIME}"
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
-    mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    mp4_path = f"{rollout_dir}/episode={idx}--success={success}--task={processed_task_description}.mp4"
     video_writer = imageio.get_writer(mp4_path, fps=30)
     for img in rollout_images:
         video_writer.append_data(img)

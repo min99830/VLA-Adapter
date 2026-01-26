@@ -144,6 +144,20 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert sum([cfg.use_l1_regression, cfg.use_simple_mlp_head]) == 1, "Only one action head can be used at a time!"
 
 
+def update_save_version(cfg: GenerateConfig) -> None:
+    """Update save_version based on model configuration."""
+    version_parts = []
+
+    if cfg.save_version:
+        version_parts.append(cfg.save_version)
+    if cfg.use_l1_regression:
+        version_parts.append("l1reg")
+    elif cfg.use_simple_mlp_head:
+        version_parts.append("simplemlp")
+
+    cfg.save_version = "-".join(version_parts)
+
+
 def initialize_model(cfg: GenerateConfig):
     """Initialize model and associated components."""
     # Load model
@@ -478,6 +492,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
     # Validate configuration
     validate_config(cfg)
+
+    # Update save version
+    update_save_version(cfg)
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
