@@ -101,10 +101,16 @@ class ExtractConfig:
     use_pro_version: bool = True
     phase: str = "Extraction"
     save_features: bool = True                       # Always True for this script
+    
+    # Run ID
+    run_id_override: Optional[str] = None            # Optional string to override the run ID with
     # fmt: on
 
 def get_run_id(cfg) -> str:
     """Generates an identifier string for the extraction run."""
+    if cfg.run_id_override is not None:
+        return cfg.run_id_override
+        
     run_id = (
         f"EXTRACT+{cfg.config_file_path.split('/')[-1]}+{cfg.dataset_name}"
         f"--{datetime.now().strftime('%Y_%m_%d-%H_%M_%S')}"
@@ -361,6 +367,19 @@ def extract_features(cfg: ExtractConfig) -> None:
 
     print(f"Starting extraction... Saving to {feature_save_dir}")
     
+    # Resume logic
+    start_batch_idx = 0
+    if os.path.exists(feature_save_dir):
+        existing_files = [f for f in os.listdir(feature_save_dir) if f.startswith("batch_") and f.endswith(f"_rank_{device_id}.npz")]
+        if existing_files:
+            try:
+                indices = [int(f.split("_")[1]) for f in existing_files]
+                if indices:
+                    start_batch_idx = max(indices) + 1
+                    print(f"Device {device_id}: Found existing features. Resuming from batch index {start_batch_idx}")
+            except ValueError:
+                pass
+
     # Use len(dataloader) if possible, otherwise max_steps
     try:
         total_batches = min(len(dataloader), cfg.max_steps)
@@ -369,6 +388,9 @@ def extract_features(cfg: ExtractConfig) -> None:
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm.tqdm(dataloader, total=total_batches, desc="Extracting")):
+            if batch_idx < start_batch_idx:
+                continue
+
             if batch_idx >= cfg.max_steps:
                 break
                 
