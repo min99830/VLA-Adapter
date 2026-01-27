@@ -17,7 +17,7 @@ import torch.nn as nn
 import tqdm
 from accelerate import PartialState
 from huggingface_hub import snapshot_download
-from peft import PeftModel, get_peft_model, LoraConfig
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import (
     AutoConfig,
@@ -63,6 +63,7 @@ from utils.feature_io import save_train_features
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", message="Length of IterableDataset")
 
+
 @dataclass
 class ExtractConfig:
     # fmt: off
@@ -82,7 +83,7 @@ class ExtractConfig:
     use_simple_mlp_head: bool = False                # If True, uses simple MLP action head
     use_diffusion: bool = False                      # If True, uses diffusion (for structure compatibility)
     use_film: bool = False                           # If True, uses FiLM
-    num_images_in_input: int = 1                     # Number of images in the VLA input
+    num_images_in_input: int = 2                     # Number of images in the VLA input
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
     # Extraction configuration
@@ -106,11 +107,12 @@ class ExtractConfig:
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     # fmt: on
 
+
 def get_run_id(cfg) -> str:
     """Generates an identifier string for the extraction run."""
     if cfg.run_id_override is not None:
         return cfg.run_id_override
-        
+
     run_id = (
         f"EXTRACT+{cfg.config_file_path.split('/')[-1]}+{cfg.dataset_name}"
         f"--{datetime.now().strftime('%Y_%m_%d-%H_%M_%S')}"
@@ -123,14 +125,14 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     if not os.path.exists(checkpoint_path):
         # try finding without step if generic
         checkpoint_path = os.path.join(path, f"{module_name}--checkpoint.pt")
-    
+
     print(f"Loading checkpoint: {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
         print(f"Warning: Checkpoint {checkpoint_path} not found.")
         return {}
-        
+
     state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
-    
+
     # Remove DDP prefix if present
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -150,13 +152,13 @@ def init_module(
     to_bf16: bool = False,
 ) -> nn.Module:
     module = module_class(**module_args)
-    
+
     # Try to load checkpoint if resum_vla_path looks like a checkpoint directory
     # For extraction, we assume weights are in the path provided or standard locations
     if os.path.isdir(cfg.resum_vla_path):
         # Try to find a checkpoint file
         # This is a simplification; users might need to point to specific checkpoints
-        state_dict = load_checkpoint(module_name, cfg.resum_vla_path, 0) # Step 0 as placeholder
+        state_dict = load_checkpoint(module_name, cfg.resum_vla_path, 0)  # Step 0 as placeholder
         if state_dict:
             module.load_state_dict(state_dict, strict=False)
             print(f"Loaded {module_name} from {cfg.resum_vla_path}")
@@ -177,7 +179,7 @@ def extract_features(cfg: ExtractConfig) -> None:
     # Create run directory
     run_dir = cfg.run_root_dir / run_id
     os.makedirs(run_dir, exist_ok=True)
-    
+
     feature_save_dir = run_dir / "features"
 
     # GPU setup
@@ -207,13 +209,13 @@ def extract_features(cfg: ExtractConfig) -> None:
     if cfg.use_minivlm and not os.path.isdir(cfg.vlm_path):
         hf_token = ""
         if "prism-qwen25-extra-dinosiglip-224px-0_5b" in cfg.vlm_path:
-             vlm = load(cfg.vlm_path, hf_token=hf_token, load_for_training=True)
+            vlm = load(cfg.vlm_path, hf_token=hf_token, load_for_training=True)
         else:
-             vlm = load_vla(cfg.vlm_path, hf_token=hf_token, load_for_training=True)
-             
+            vlm = load_vla(cfg.vlm_path, hf_token=hf_token, load_for_training=True)
+
         config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
         vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16).to(device_id)
-        
+
         # Mapping logic from finetune.py
         replace_map = [
             ("vision_backbone.dino_featurizer", "vision_backbone.featurizer"),
@@ -325,7 +327,7 @@ def extract_features(cfg: ExtractConfig) -> None:
     # Dataset Setup
     action_tokenizer = ActionTokenizer(processor.tokenizer)
     use_wrist_image = cfg.num_images_in_input > 1
-    
+
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         processor.tokenizer,
@@ -352,25 +354,31 @@ def extract_features(cfg: ExtractConfig) -> None:
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True,
     )
 
     # Extraction Loop
     vla.eval()
-    if action_head: action_head.eval()
-    if proprio_projector: proprio_projector.eval()
-    
+    if action_head:
+        action_head.eval()
+    if proprio_projector:
+        proprio_projector.eval()
+
     num_patches = vla.vision_backbone.get_num_patches() * vla.vision_backbone.get_num_images_in_input()
     if isinstance(vla, PeftModel):
-         # access underlying model if wrapped
-         pass
+        # access underlying model if wrapped
+        pass
 
     print(f"Starting extraction... Saving to {feature_save_dir}")
-    
+
     # Resume logic
     start_batch_idx = 0
     if os.path.exists(feature_save_dir):
-        existing_files = [f for f in os.listdir(feature_save_dir) if f.startswith("batch_") and f.endswith(f"_rank_{device_id}.npz")]
+        existing_files = [
+            f for f in os.listdir(feature_save_dir) if f.startswith("batch_") and f.endswith(f"_rank_{device_id}.npz")
+        ]
         if existing_files:
             try:
                 indices = [int(f.split("_")[1]) for f in existing_files]
@@ -393,12 +401,12 @@ def extract_features(cfg: ExtractConfig) -> None:
 
             if batch_idx >= cfg.max_steps:
                 break
-                
+
             # Prepare inputs
             input_ids = batch["input_ids"].to(device_id)
             attention_mask = batch["attention_mask"].to(device_id)
             pixel_values = batch["pixel_values"].to(torch.bfloat16).to(device_id)
-            
+
             # Prepare labels if they are not in batch or are incorrect for mask gen
             if "labels" in batch and batch["labels"] is not None:
                 labels = batch["labels"].to(device_id)
@@ -406,7 +414,7 @@ def extract_features(cfg: ExtractConfig) -> None:
                 # If labels are missing, fallback to input_ids but this might fail mask logic
                 # unless they actually contain action tokens in the right range.
                 labels = input_ids.clone()
-            
+
             ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
 
             # Prepare proprio
@@ -431,43 +439,70 @@ def extract_features(cfg: ExtractConfig) -> None:
             ground_truth_token_ids = labels[:, 1:].to(device_id)
             current_action_mask = get_current_action_mask(ground_truth_token_ids)
             next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
+
+            multi_layer_task_states = []
+            multi_layer_action_states = []
+            multi_layer_text_states = []
             
-            multi_layer_hidden_states = []
             for item in output.hidden_states[0:]:
                 text_hidden_states = item[:, num_patches:-1]
                 batch_size_curr = input_ids.shape[0]
-                
+
+                action_mask = current_action_mask | next_actions_mask
                 actions_hidden_states = (
-                    text_hidden_states[current_action_mask | next_actions_mask]
+                    text_hidden_states[action_mask]
                     .reshape(batch_size_curr, 1, NUM_TOKENS, -1)
                     .to(torch.bfloat16)
                 )
+                
+                # Extract non-action text tokens (e.g., instructions and padding)
+                # Reshape to (batch, 1, num_text_tokens, dim)
+                text_only_hidden_states = (
+                    text_hidden_states[~action_mask]
+                    .reshape(batch_size_curr, 1, -1, item.shape[-1])
+                    .to(torch.bfloat16)
+                )
+                
                 task_latten_states = item[:, :num_patches].reshape(batch_size_curr, 1, num_patches, -1)
-                all_hidden_states = torch.cat((task_latten_states, actions_hidden_states), 2)
-                multi_layer_hidden_states.append(all_hidden_states)
+                
+                multi_layer_task_states.append(task_latten_states)
+                multi_layer_action_states.append(actions_hidden_states)
+                multi_layer_text_states.append(text_only_hidden_states)
+
+            multi_layer_task_states = torch.cat(multi_layer_task_states, dim=1)
+            multi_layer_action_states = torch.cat(multi_layer_action_states, dim=1)
+            multi_layer_text_states = torch.cat(multi_layer_text_states, dim=1)
             
-            multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim=1)
+            # Reconstruct concatenated states for action head prediction if needed
+            multi_layer_hidden_states = torch.cat([multi_layer_task_states, multi_layer_action_states], dim=2)
 
             # Predict Actions (if head exists)
             predicted_actions = None
             if action_head:
                 predicted_actions = action_head.predict_action(
                     multi_layer_hidden_states,
-                    proprio=batch["proprio"].to(device_id).to(torch.bfloat16) if cfg.use_proprio and batch["proprio"] is not None else None,
+                    proprio=(
+                        batch["proprio"].to(device_id).to(torch.bfloat16)
+                        if cfg.use_proprio and batch["proprio"] is not None
+                        else None
+                    ),
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     phase=cfg.phase,
                 )
-            
+
             # Save Features
             save_train_features(
                 save_dir=feature_save_dir,
                 batch_idx=batch_idx,
                 device_id=device_id,
-                hidden_states=multi_layer_hidden_states,
+                task_hidden_states=multi_layer_task_states,
+                action_hidden_states=multi_layer_action_states,
+                text_hidden_states=multi_layer_text_states,
                 predicted_actions=predicted_actions if predicted_actions is not None else torch.tensor([]),
                 ground_truth_actions=ground_truth_actions,
-                input_ids=batch["input_ids"]
+                input_ids=batch["input_ids"],
             )
-            
+
+
 if __name__ == "__main__":
     extract_features()
