@@ -1,25 +1,17 @@
 """
-extract_features.py
+extract_features.py (Legacy Version)
 
-Extracts features from a trained VLA model using a dataset.
+Extracts features from a trained VLA model using a dataset and saves as .npz files.
 """
 
-import glob
-import io
 import os
-import sys
-import tarfile
-import threading
-import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Type
 
 import draccus
-import numpy as np
 import torch
 import torch.nn as nn
 import tqdm
@@ -65,259 +57,54 @@ from prismatic.vla.constants import (
     PROPRIO_DIM,
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
-from utils.feature_io import WebDatasetShardWriter, save_train_features
-
-# Add current directory to path to import sibling scripts if package structure is tricky
-sys.path.append(os.getcwd())
-# Also try adding vla-scripts to path to import convert_features_to_wds
-sys.path.append(os.path.join(os.getcwd(), "vla-scripts"))
-
-try:
-    from vla_scripts.convert_features_to_wds import convert_folder
-except ImportError:
-    # Fallback if running from root
-    try:
-        from convert_features_to_wds import convert_folder
-    except ImportError:
-        print("Warning: Could not import convert_folder. Legacy conversion might fail.")
-        convert_folder = None
+from utils.feature_io import save_train_features
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", message="Length of IterableDataset")
 
 
-def get_start_batch_idx(feature_save_dir: Path, batch_size: int, device_id: int) -> int:
-    """
-    Determines the starting batch index by inspecting existing WebDataset shards.
-    Checks layer_0 as a reference.
-    """
-    # Only the main process (or rank 0 of the group writing to this dir) should dictate,
-    # but here we assume all ranks write to different files OR we just check the output.
-    # Since we split by layer, and every rank processes the whole batch (DDP? No, this script uses PartialState but seems to run independent batches if distributed?
-    # Wait, the script sets device_id = distributed_state.local_process_index
-    # And dataloader seems to load everything?
-    # "sampler=None" in DataLoader.
-    # If this is multi-GPU extraction, usually we split the dataset.
-    # But the current script doesn't seem to split the dataset explicitly in the Dataset class logic shown.
-    # It assumes independent execution or simple data parallelism.
-    # Let's assume we check layer_0.
-
-    layer_0_dir = feature_save_dir / "layer_0"
-    if not layer_0_dir.exists():
-        return 0
-
-    shard_files = sorted(glob.glob(str(layer_0_dir / "shard_*.tar")))
-    if not shard_files:
-        return 0
-
-    last_shard = shard_files[-1]
-    last_idx = -1
-
-    try:
-        # We need to find the last key in this tar file.
-        # Efficiently: reverse iterate? tarfile doesn't support that easily.
-        # We just iterate headers.
-        with tarfile.open(last_shard, "r") as tar:
-            for member in tar:
-                if member.name.endswith(".npz"):
-                    # key is filename without extension
-                    try:
-                        key_idx = int(member.name.replace(".npz", ""))
-                        if key_idx > last_idx:
-                            last_idx = key_idx
-                    except ValueError:
-                        pass
-    except Exception as e:
-        print(f"Error reading checkpoint shard {last_shard}: {e}")
-        return 0
-
-    if last_idx == -1:
-        return 0
-
-    # last_idx is the global sample index.
-    # next sample is last_idx + 1
-    # next batch starts at ceil((last_idx + 1) / batch_size) ?
-    # Actually, if we processed sample 0..7 (batch 0), last_idx=7. (7+1)//8 = 1. Start batch 1.
-    # If we processed sample 0..3 (partial batch 0), last_idx=3. (3+1)//8 = 0.
-    # But we probably want to restart the partial batch or just move on?
-    # For safety, let's restart the batch that contains the next sample.
-
-    start_batch = (last_idx + 1) // batch_size
-    print(f"Found last sample index {last_idx}. Resuming from batch {start_batch}.")
-    return start_batch
-
-
-class FeatureSaver:
-    def __init__(self, output_dir: Path, max_workers: int = 1, queue_size: int = 4):
-        self.output_dir = output_dir
-        self.shard_writers = {}  # layer_idx -> WebDatasetShardWriter
-        self.global_sample_count = 0
-
-        # Async execution to prevent IO blocking GPU
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        self.futures = []
-        
-        # Backpressure: Limit queue size to avoid OOM
-        self.semaphore = threading.BoundedSemaphore(value=queue_size)
-
-    def save(
-        self,
-        multi_layer_task_states,
-        multi_layer_action_states,
-        multi_layer_text_states,
-        predicted_actions,
-        ground_truth_actions,
-        input_ids,
-    ):
-        # Acquire semaphore - blocks if too many tasks are pending
-        self.semaphore.acquire()
-        
-        # 1. Move everything to CPU/Numpy immediately (Main Thread)
-        # This blocks briefly but unblocks GPU for next batch
-
-        batch_size = input_ids.shape[0]
-        num_layers = multi_layer_task_states.shape[1]
-
-        # Prepare data dicts for the worker
-        # We assume consistent ordering
-
-        def to_cpu_np(t):
-            if t is None:
-                return None
-            return t.detach().float().cpu().numpy()
-
-        # These are large tensors, copying to CPU is necessary
-        task_states_np = to_cpu_np(multi_layer_task_states)
-        action_states_np = to_cpu_np(multi_layer_action_states)
-        text_states_np = to_cpu_np(multi_layer_text_states)
-
-        gt_actions_np = to_cpu_np(ground_truth_actions)
-        input_ids_np = input_ids.detach().cpu().numpy()  # int
-        pred_actions_np = to_cpu_np(predicted_actions) if predicted_actions is not None else None
-
-        current_sample_start_idx = self.global_sample_count
-        self.global_sample_count += batch_size
-
-        # 2. Submit task to background thread
-        future = self.executor.submit(
-            self._save_worker,
-            batch_size,
-            num_layers,
-            current_sample_start_idx,
-            task_states_np,
-            action_states_np,
-            text_states_np,
-            gt_actions_np,
-            input_ids_np,
-            pred_actions_np,
-        )
-        # Callback to release semaphore
-        future.add_done_callback(lambda _: self.semaphore.release())
-        
-        self.futures.append(future)
-
-        # Optional: cleanup finished futures to keep list small
-        self.futures = [f for f in self.futures if not f.done()]
-
-    def _save_worker(
-        self,
-        batch_size,
-        num_layers,
-        start_idx,
-        task_states,
-        action_states,
-        text_states,
-        gt_actions,
-        input_ids,
-        pred_actions,
-    ):
-        # Initialize writers if needed (Thread-safe check?)
-        # We assume writers are thread-safe or we are the only worker writing to these specific handles.
-        # Since we use ThreadPoolExecutor with max_workers=1 (default) or we serialize logic, it's fine.
-        # If max_workers > 1, we need to be careful about ShardWriter state (current_tar).
-        # WebDatasetShardWriter is NOT thread safe if shared across threads.
-        # But here we write sequentially in the worker.
-        # If we parallelize *batches*, we might have issues.
-        # For now, let's assume serial execution in the worker (single consumer).
-
-        if not self.shard_writers:
-            for i in range(num_layers):
-                layer_dir = self.output_dir / f"layer_{i}"
-                self.shard_writers[i] = WebDatasetShardWriter(layer_dir)
-
-        for b in range(batch_size):
-            sample_key = f"{start_idx + b:09d}"
-
-            record_base = {
-                "input_ids": input_ids[b],
-                "ground_truth_actions": gt_actions[b],
-            }
-            if pred_actions is not None:
-                record_base["predicted_actions"] = pred_actions[b]
-
-            for l in range(num_layers):
-                # Data is already numpy
-                record = record_base.copy()
-                record["task_hidden_states"] = task_states[b, l]
-                record["action_hidden_states"] = action_states[b, l]
-                record["text_hidden_states"] = text_states[b, l]
-
-                self.shard_writers[l].write(sample_key, record)
-
-    def flush(self):
-        # Wait for all tasks
-        for f in self.futures:
-            f.result()
-        self.futures = []
-
-        for writer in self.shard_writers.values():
-            writer.close()
-
-
 @dataclass
-class ExtractConfig:  # fmt: off
-    config_file_path: str = "openvla/openvla-7b"  # Path to necessary config files of LA-Adapter
-    vlm_path: str = "openvla/openvla-7b"  # Path to OpenVLA model (on HuggingFace Hub or stored locally)
-    use_minivlm: bool = False  #
-    resum_vla_path: str = "openvla/openvla-7b"  # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+class ExtractConfig:
+    # fmt: off
+    config_file_path: str = "openvla/openvla-7b"     # Path to necessary config files of LA-Adapter
+    vlm_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+    use_minivlm: bool = False                        # 
+    resum_vla_path: str = "openvla/openvla-7b"       # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
     # Dataset
-    data_root_dir: Path = Path("datasets/rlds")  # Directory containing RLDS datasets
-    dataset_name: str = "aloha_scoop_x_into_bowl"  # Name of dataset
-    run_root_dir: Path = Path("runs")  # Path to directory to store features
-    shuffle_buffer_size: int = 1  # Set to 1 to disable shuffling for matched extraction
+    data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
+    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of dataset
+    run_root_dir: Path = Path("runs")                # Path to directory to store features
+    shuffle_buffer_size: int = 1                     # Set to 1 to disable shuffling for matched extraction
 
     # Algorithm and architecture
-    use_l1_regression: bool = True  # If True, uses L1 regression action head
-    use_simple_mlp_head: bool = False  # If True, uses simple MLP action head
-    use_diffusion: bool = False  # If True, uses diffusion (for structure compatibility)
-    use_film: bool = False  # If True, uses FiLM
-    num_images_in_input: int = 2  # Number of images in the VLA input
-    use_proprio: bool = False  # If True, includes robot proprioceptive state in input
+    use_l1_regression: bool = True                   # If True, uses L1 regression action head
+    use_simple_mlp_head: bool = False                # If True, uses simple MLP action head
+    use_diffusion: bool = False                      # If True, uses diffusion (for structure compatibility)
+    use_film: bool = False                           # If True, uses FiLM
+    num_images_in_input: int = 2                     # Number of images in the VLA input
+    use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
     # Extraction configuration
-    batch_size: int = 8  # Batch size per device
-    max_steps: int = 200000  # Max number of steps to extract
-    image_aug: bool = False  # If True, uses image augmentations (usually False for extraction)
+    batch_size: int = 8                              # Batch size per device
+    max_steps: int = 200000                          # Max number of steps to extract
+    image_aug: bool = False                          # If True, uses image augmentations (usually False for extraction)
     
-    # I/O Configuration
-    io_queue_size: int = 4 # Number of batches to buffer in memory for writing (prevents OOM)
-
     # LoRA / Checkpoint
-    use_lora: bool = False  # If True, loads LoRA adapter
-    lora_rank: int = 32  # Rank of LoRA weight matrix
-
+    use_lora: bool = False                           # If True, loads LoRA adapter
+    lora_rank: int = 32                              # Rank of LoRA weight matrix
+    
     # Full Finetune structure compatibility
     use_fz: bool = False
 
     # revision version
     use_pro_version: bool = True
     phase: str = "Extraction"
-    save_features: bool = True  # Always True for this script
-
+    save_features: bool = True                       # Always True for this script
+    
     # Run ID
-    run_id_override: Optional[str] = None  # Optional string to override the run ID with
+    run_id_override: Optional[str] = None            # Optional string to override the run ID with
     # fmt: on
 
 
@@ -401,51 +188,7 @@ def extract_features(cfg: ExtractConfig) -> None:
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
 
-    # Check for legacy .npz files in the ORIGINAL dir
-    legacy_start_batch_idx = 0
-    if feature_save_dir.exists():
-        legacy_files = glob.glob(os.path.join(feature_save_dir, "batch_*.npz"))
-        # Filter by rank if needed? The filenames are batch_{idx}_rank_{device}.npz
-        # We'll just take the max batch index found.
-        indices = []
-        for f in legacy_files:
-            try:
-                # Extract batch index
-                parts = f.split("/")[-1].split("_")
-                # format: batch_123_rank_0.npz -> parts: ['batch', '123', 'rank', '0.npz']
-                if len(parts) >= 2 and parts[0] == "batch":
-                    indices.append(int(parts[1]))
-            except ValueError:
-                pass
-
-        if indices:
-            legacy_start_batch_idx = max(indices) + 1
-            print(f"Device {device_id}: Found {len(indices)} legacy .npz files. Last batch: {max(indices)}.")
-
-            # Switch to WDS dir
-            run_dir = Path(str(run_dir) + "_wds")
-            feature_save_dir = run_dir / "features"
-            print(f"Switching output to {feature_save_dir} for WebDataset format.")
-
-            # Check if we need to convert
-            # We assume if layer_0 exists and has shards, it's done.
-            layer_0_check = feature_save_dir / "layer_0"
-            if not layer_0_check.exists() or not glob.glob(str(layer_0_check / "*.tar")):
-                if convert_folder:
-                    print("Converting legacy files to WebDataset format before resuming...")
-                    # input is original feature_save_dir (which variable is overwritten? No, original was cfg.run_root_dir / run_id / features)
-                    # Wait, I overwrote run_dir and feature_save_dir. I need the old one.
-                    # Reconstruct old path
-                    old_run_id = get_run_id(cfg)  # This returns the original ID
-                    old_feature_save_dir = cfg.run_root_dir / old_run_id / "features"
-
-                    convert_folder(old_feature_save_dir, feature_save_dir)
-                else:
-                    print("Error: convert_folder not available. Skipping conversion.")
-
-            os.makedirs(feature_save_dir, exist_ok=True)
-
-    # GPU setup
+    # Model Setup logic similar to finetune.py
     if model_is_on_hf_hub(cfg.config_file_path):
         vla_download_path = snapshot_download(repo_id=cfg.config_file_path)
         cfg.config_file_path = vla_download_path
@@ -631,11 +374,19 @@ def extract_features(cfg: ExtractConfig) -> None:
     print(f"Starting extraction... Saving to {feature_save_dir}")
 
     # Resume logic
-    wds_start_batch_idx = get_start_batch_idx(feature_save_dir, cfg.batch_size, device_id)
-    start_batch_idx = max(legacy_start_batch_idx, wds_start_batch_idx)
-
-    if start_batch_idx > 0:
-        print(f"Resuming from batch {start_batch_idx} (Legacy: {legacy_start_batch_idx}, WDS: {wds_start_batch_idx})")
+    start_batch_idx = 0
+    if os.path.exists(feature_save_dir):
+        existing_files = [
+            f for f in os.listdir(feature_save_dir) if f.startswith("batch_") and f.endswith(f"_rank_{device_id}.npz")
+        ]
+        if existing_files:
+            try:
+                indices = [int(f.split("_")[1]) for f in existing_files]
+                if indices:
+                    start_batch_idx = max(indices) + 1
+                    print(f"Device {device_id}: Found existing features. Resuming from batch index {start_batch_idx}")
+            except ValueError:
+                pass
 
     # Use len(dataloader) if possible, otherwise max_steps
     try:
@@ -643,41 +394,11 @@ def extract_features(cfg: ExtractConfig) -> None:
     except:
         total_batches = cfg.max_steps
 
-    feature_saver = FeatureSaver(feature_save_dir, queue_size=cfg.io_queue_size)
-    # Set global sample count to match where we left off
-    feature_saver.global_sample_count = start_batch_idx * cfg.batch_size
-    # Fast-forward dataloader if needed
-    # Note: islice works on iterables. DataLoader is iterable.
-    import itertools
-
-    if start_batch_idx > 0:
-        print(f"Fast-forwarding dataloader to batch {start_batch_idx}...")
-        # If dataloader supports efficient seeking, use it. Otherwise consume.
-        # Standard DataLoader doesn't support seeking.
-        # But we can try to use islice on the iterator.
-
-        # We need to construct the iterator first
-        dataloader_iter = iter(dataloader)
-
-        # Consuming iterator is still 'slow' if it triggers data loading, but
-        # usually faster than running the full loop body.
-        # If the underlying dataset is random access (Map-style), this just iterates indices.
-        # If it's Iterable-style (streaming), it consumes data.
-        # RLDS is usually streaming.
-
-        # However, islice is the standard way.
-        # Be careful: islice returns an iterator.
-        dataloader_iter = itertools.islice(dataloader_iter, start_batch_idx, None)
-    else:
-        dataloader_iter = iter(dataloader)
-
     with torch.no_grad():
-        # Wrap iterator with tqdm manually since we are managing the iterator
-        pbar = tqdm.tqdm(
-            dataloader_iter, total=total_batches - start_batch_idx, desc="Extracting", initial=start_batch_idx
-        )
+        for batch_idx, batch in enumerate(tqdm.tqdm(dataloader, total=total_batches, desc="Extracting")):
+            if batch_idx < start_batch_idx:
+                continue
 
-        for batch_idx, batch in enumerate(pbar, start=start_batch_idx):
             if batch_idx >= cfg.max_steps:
                 break
 
@@ -722,24 +443,28 @@ def extract_features(cfg: ExtractConfig) -> None:
             multi_layer_task_states = []
             multi_layer_action_states = []
             multi_layer_text_states = []
-
+            
             for item in output.hidden_states[0:]:
                 text_hidden_states = item[:, num_patches:-1]
                 batch_size_curr = input_ids.shape[0]
 
                 action_mask = current_action_mask | next_actions_mask
                 actions_hidden_states = (
-                    text_hidden_states[action_mask].reshape(batch_size_curr, 1, NUM_TOKENS, -1).to(torch.bfloat16)
+                    text_hidden_states[action_mask]
+                    .reshape(batch_size_curr, 1, NUM_TOKENS, -1)
+                    .to(torch.bfloat16)
                 )
-
+                
                 # Extract non-action text tokens (e.g., instructions and padding)
                 # Reshape to (batch, 1, num_text_tokens, dim)
                 text_only_hidden_states = (
-                    text_hidden_states[~action_mask].reshape(batch_size_curr, 1, -1, item.shape[-1]).to(torch.bfloat16)
+                    text_hidden_states[~action_mask]
+                    .reshape(batch_size_curr, 1, -1, item.shape[-1])
+                    .to(torch.bfloat16)
                 )
-
+                
                 task_latten_states = item[:, :num_patches].reshape(batch_size_curr, 1, num_patches, -1)
-
+                
                 multi_layer_task_states.append(task_latten_states)
                 multi_layer_action_states.append(actions_hidden_states)
                 multi_layer_text_states.append(text_only_hidden_states)
@@ -747,7 +472,7 @@ def extract_features(cfg: ExtractConfig) -> None:
             multi_layer_task_states = torch.cat(multi_layer_task_states, dim=1)
             multi_layer_action_states = torch.cat(multi_layer_action_states, dim=1)
             multi_layer_text_states = torch.cat(multi_layer_text_states, dim=1)
-
+            
             # Reconstruct concatenated states for action head prediction if needed
             multi_layer_hidden_states = torch.cat([multi_layer_task_states, multi_layer_action_states], dim=2)
 
@@ -766,16 +491,17 @@ def extract_features(cfg: ExtractConfig) -> None:
                 )
 
             # Save Features
-            feature_saver.save(
-                multi_layer_task_states=multi_layer_task_states,
-                multi_layer_action_states=multi_layer_action_states,
-                multi_layer_text_states=multi_layer_text_states,
+            save_train_features(
+                save_dir=feature_save_dir,
+                batch_idx=batch_idx,
+                device_id=device_id,
+                task_hidden_states=multi_layer_task_states,
+                action_hidden_states=multi_layer_action_states,
+                text_hidden_states=multi_layer_text_states,
                 predicted_actions=predicted_actions if predicted_actions is not None else torch.tensor([]),
                 ground_truth_actions=ground_truth_actions,
                 input_ids=batch["input_ids"],
             )
-
-    feature_saver.flush()
 
 
 if __name__ == "__main__":

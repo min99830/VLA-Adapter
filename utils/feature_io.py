@@ -1,5 +1,9 @@
 import logging
 import os
+import tarfile
+import io
+import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from threading import BoundedSemaphore
@@ -17,6 +21,55 @@ io_executor = ThreadPoolExecutor(max_workers=1)
 # Prevents memory buildup if producer (GPU) is faster than consumer (Disk)
 # Limit pending writes to 32 batches.
 write_semaphore = BoundedSemaphore(value=32)
+
+
+class WebDatasetShardWriter:
+    def __init__(self, output_dir: Path, max_size: int = 500 * 1024 * 1024, filename_pattern: str = "shard_{:06d}.tar"):
+        self.output_dir = Path(output_dir)
+        self.max_size = max_size
+        self.filename_pattern = filename_pattern
+        
+        self.shard_count = 0
+        self.current_tar = None
+        self.current_tar_path = None
+        self.current_size = 0
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._open_new_shard()
+
+    def _open_new_shard(self):
+        if self.current_tar:
+            self.current_tar.close()
+        
+        self.current_tar_path = self.output_dir / self.filename_pattern.format(self.shard_count)
+        self.current_tar = tarfile.open(self.current_tar_path, "w")
+        self.current_size = 0
+        self.shard_count += 1
+        
+    def write(self, sample_key: str, data: dict):
+        # Serialize data to .npz in memory
+        with io.BytesIO() as bio:
+            np.savez_compressed(bio, **data)
+            bio.seek(0)
+            file_bytes = bio.getvalue()
+            
+        file_size = len(file_bytes)
+        
+        # Check if we need to rotate shard
+        if self.current_size + file_size > self.max_size:
+            self._open_new_shard()
+            
+        # Add to tar
+        tar_info = tarfile.TarInfo(name=f"{sample_key}.npz")
+        tar_info.size = file_size
+        tar_info.mtime = time.time()
+        
+        self.current_tar.addfile(tar_info, io.BytesIO(file_bytes))
+        self.current_size += file_size
+
+    def close(self):
+        if self.current_tar:
+            self.current_tar.close()
 
 
 def _save_npz_task(save_path, **kwargs):
