@@ -6,88 +6,161 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+# Import constants directly
+from prismatic.vla.constants import (
+    ACTION_DIM,
+    ACTION_TOKEN_BEGIN_IDX,
+    IGNORE_INDEX,
+    NUM_ACTIONS_CHUNK,
+)
+from utils.feature_dataset import FeatureDataset
+
 try:
+    from transformers import AutoProcessor
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
     from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-    from prismatic.vla.datasets import RLDSDataset, RLDSBatchTransform
     from prismatic.models.backbones.llm.prompting import PurePromptBuilder
     from prismatic.util.data_utils import PaddedCollatorForActionPrediction
     from prismatic.vla.action_tokenizer import ActionTokenizer
-    from transformers import AutoProcessor
+    from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 except ImportError:
     OpenVLAForActionPrediction = None
 
 
+# Local implementation of mask functions to fix cumsum error AND shape mismatch
+def get_current_action_mask(token_ids):
+    if not isinstance(token_ids, torch.Tensor):
+        token_ids = torch.tensor(token_ids)
+
+    # We need to return a mask with exactly NUM_ACTIONS_CHUNK True values per sequence
+    # to match the model's action_queries shape (when using Libero constants).
+
+    mask = torch.zeros_like(token_ids, dtype=torch.bool)
+
+    # Iterate over batch to handle each sequence
+    # This is a bit slow but safe given the mismatch issues
+    if token_ids.ndim == 1:
+        token_ids = token_ids.unsqueeze(0)
+
+    for i in range(token_ids.shape[0]):
+        # Find start of action sequence (first non-ignore token)
+        # We assume actions are at the end.
+        # token_ids is (seq_len)
+
+        # Find indices where it's NOT ignore index
+        valid_indices = (token_ids[i] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+
+        if len(valid_indices) > 0:
+            start_idx = valid_indices[0]
+            # Mark NUM_ACTIONS_CHUNK tokens starting from start_idx
+            # We assume sequence is long enough. If not, clip to end.
+            end_idx = min(start_idx + NUM_ACTIONS_CHUNK, token_ids.shape[1])
+            mask[i, start_idx:end_idx] = True
+
+            # If we couldn't fit 8 tokens (e.g. at end of seq), we might still have a mismatch.
+            # But RLDSBatchTransform usually pads to 64, so it should be fine.
+        else:
+            # Fallback if no valid tokens found: just mark the last N tokens?
+            # This avoids 0-size mask
+            mask[i, -NUM_ACTIONS_CHUNK:] = True
+
+    return mask
+
+
+def get_next_actions_mask(token_ids):
+    # This usually masks "future" actions.
+    # If we redefined current to be the chunk of 8, next might be empty or everything after.
+    # For SAE extraction on 'action' or 'text', we want consistency.
+
+    if not isinstance(token_ids, torch.Tensor):
+        token_ids = torch.tensor(token_ids)
+
+    # Use standard logic for "next" or just inverse?
+    # extract_features.py uses: action_mask = current | next
+    # If current covers the whole action chunk (8), then next should probably be empty or everything after.
+
+    # Let's keep the logic consistent with current mask: everything AFTER the chunk.
+
+    mask = torch.zeros_like(token_ids, dtype=torch.bool)
+    if token_ids.ndim == 1:
+        token_ids = token_ids.unsqueeze(0)
+
+    for i in range(token_ids.shape[0]):
+        valid_indices = (token_ids[i] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+        if len(valid_indices) > 0:
+            start_idx = valid_indices[0]
+            chunk_end = min(start_idx + NUM_ACTIONS_CHUNK, token_ids.shape[1])
+            # Next actions are everything after the chunk
+            mask[i, chunk_end:] = True
+
+    return mask
+
+
 class ActivationsStore:
+    """
+    ActivationsStore dedicated to OpenVLA.
+    Supports two modes:
+    1. Online: Extracts features from a loaded model using RLDS dataset.
+    2. Offline: Loads pre-extracted features from .npz files using FeatureDataset.
+    """
+
     def __init__(
         self,
-        model,
+        model,  # Used for Online mode
         cfg: dict,
+        proprio_projector=None,
     ):
         self.cfg = cfg
         self.device = cfg["device"]
-        self.model_batch_size = cfg["model_batch_size"]
-        self.num_batches_in_buffer = cfg["num_batches_in_buffer"]
-        self.is_feature_dataset = cfg.get("is_feature_dataset", False)
+        self.is_offline = cfg.get("is_offline", False)
+        self.target_feature = cfg.get("target_feature", "task_hidden_states")
         self.verified_features = False
 
-        if self.is_feature_dataset:
-            print("Loading feature dataset from disk...")
-            self.dataset_path = cfg["dataset_path"]
-            
-            # Check for WebDataset (.tar) or original (.npz)
-            self.tar_files = sorted(glob.glob(os.path.join(self.dataset_path, "**", "*.tar"), recursive=True))
-            if not self.tar_files:
-                # Try finding one level deeper if dataset_path is root and not layer specific
-                # But typically cfg['layer'] should define the path?
-                # Let's assume dataset_path might be root, and we need layer_{layer}
-                layer_path = os.path.join(self.dataset_path, f"layer_{cfg.get('layer', 0)}")
-                self.tar_files = sorted(glob.glob(os.path.join(layer_path, "*.tar")))
-            
-            if self.tar_files:
-                print(f"Found {len(self.tar_files)} WebDataset shards. Using 'datasets' streaming.")
-                from datasets import load_dataset
-                self.is_webdataset = True
-                
-                # Load dataset
-                # We need to handle the case where we might want to shuffle
-                ds = load_dataset("webdataset", data_files=self.tar_files, split="train", streaming=True)
-                # Shuffle with a buffer
-                self.dataset = iter(ds.shuffle(buffer_size=cfg.get("shuffle_buffer_size", 1000)))
-                
-            else:
-                self.is_webdataset = False
-                self.files = sorted(glob.glob(os.path.join(self.dataset_path, "*.npz")))
-                if not self.files:
-                    raise ValueError(f"No .tar or .npz files found in {self.dataset_path}")
-                print(f"Found {len(self.files)} feature files.")
-                self.file_idx = 0
-                # np.random.shuffle(self.files)
+        if self.is_offline:
+            print(f"Initializing ActivationsStore in OFFLINE mode (FeatureDataset)...")
+            print(f"Dataset path: {cfg['dataset_path']}")
+            self.dataset = FeatureDataset(cfg["dataset_path"], device="cpu", flatten=True)
+            self.dataloader = DataLoader(
+                self.dataset,
+                batch_size=cfg["batch_size"],
+                shuffle=True,
+                num_workers=cfg.get("num_workers", 4),
+                pin_memory=True if self.device != "cpu" else False,
+            )
+            self.dataloader_iter = iter(self.dataloader)
         else:
+            if proprio_projector is None:
+                raise ValueError("proprio_projector must be provided for Online mode.")
+
+            self.proprio_projector = proprio_projector
+            print(f"Initializing ActivationsStore in ONLINE mode (Model-based)...")
             self.model = model
-            self.is_openvla = True
-            print("Initializing ActivationsStore for OpenVLA...")
-            
+            self.model_batch_size = cfg.get("model_batch_size", 1)
+
             # OpenVLA Dataset Setup
             processor = AutoProcessor.from_pretrained(cfg["model_name"], trust_remote_code=True)
             action_tokenizer = ActionTokenizer(processor.tokenizer)
-            
+
             batch_transform = RLDSBatchTransform(
                 action_tokenizer,
                 processor.tokenizer,
                 image_transform=processor.image_processor.apply_transform,
                 prompt_builder_fn=PurePromptBuilder,
+                use_wrist_image=cfg.get("num_images_in_input", 1) > 1,
+                use_proprio=True,
+                use_minivlm=True,
             )
-            
-            # Use dataset path from cfg or default
-            data_root_dir = cfg.get("data_root_dir", "datasets/rlds")
+
+            data_root_dir = cfg.get("data_root_dir", "data/libero")
             dataset_name = cfg.get("dataset_name", "libero_spatial_no_noops")
-            
+
             print(f"Loading RLDS dataset: {dataset_name} from {data_root_dir}")
             dataset = RLDSDataset(
                 data_root_dir,
                 dataset_name,
                 batch_transform,
-                resize_resolution=(224, 224), # Standard OpenVLA resolution
+                resize_resolution=(224, 224),
                 shuffle_buffer_size=cfg.get("shuffle_buffer_size", 1000),
                 image_aug=False,
             )
@@ -95,7 +168,7 @@ class ActivationsStore:
             collator = PaddedCollatorForActionPrediction(
                 processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
             )
-            
+
             self.vla_dataloader = DataLoader(
                 dataset,
                 batch_size=self.model_batch_size,
@@ -106,225 +179,107 @@ class ActivationsStore:
                 pin_memory=True,
             )
             self.vla_iterator = iter(self.vla_dataloader)
-            self.hook_point = f"layers.{cfg['layer']}" # Placeholder, actual access via hidden_states
 
-        self.activation_buffer = self._fill_buffer()
-        self.dataloader = self._get_dataloader()
-        self.dataloader_iter = iter(self.dataloader)
+            # For buffer-based yield
+            self.num_batches_in_buffer = cfg.get("num_batches_in_buffer", 10)
+            self.activation_buffer = self._fill_online_buffer()
+            self.activation_dataloader = DataLoader(
+                TensorDataset(self.activation_buffer), batch_size=cfg["batch_size"], shuffle=True
+            )
+            self.activation_dataloader_iter = iter(self.activation_dataloader)
 
-    def _get_tokens_column(self):
-        # Only relevant for text dataset
-        if self.is_feature_dataset:
-            return None 
-            
-        sample = next(self.dataset)
-        if "tokens" in sample:
-            return "tokens"
-        elif "input_ids" in sample:
-            return "input_ids"
-        elif "text" in sample:
-            return "text"
-        else:
-            raise ValueError("Dataset must have a 'tokens', 'input_ids', or 'text' column.")
-
-    def get_batch_tokens(self):
-        # Not used for OpenVLA
-        all_tokens = []
-        while len(all_tokens) < self.model_batch_size * self.context_size:
-            batch = next(self.dataset)
-            if self.tokens_column == "text":
-                tokens = self.model.to_tokens(
-                    batch["text"], truncate=True, move_to_device=True, prepend_bos=True
-                ).squeeze(0)
-            else:
-                tokens = batch[self.tokens_column]
-            all_tokens.extend(tokens)
-        token_tensor = torch.tensor(all_tokens, dtype=torch.long, device=self.device)[
-            : self.model_batch_size * self.context_size
-        ]
-        return token_tensor.view(self.model_batch_size, self.context_size)
-
-    def get_activations(self, batch):
-        if self.is_feature_dataset:
-             raise NotImplementedError("Use _load_next_file_activations for disk datasets")
-             
-        if getattr(self, "is_openvla", False):
-            # OpenVLA Feature Extraction
-            with torch.no_grad():
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                pixel_values = batch["pixel_values"].to(torch.bfloat16).to(self.device)
-                
-                # Run model
-                # We need to use autocast for bfloat16/mixed precision usually
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    output = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        pixel_values=pixel_values,
-                        output_hidden_states=True,
-                    )
-                
-                # Extract hidden states from specified layer
-                # output.hidden_states is a tuple of (batch, seq_len, dim)
-                # Index 0 is embeddings, 1 is layer 1, etc.
-                # Assuming cfg['layer'] is 0-indexed corresponding to transformer layers.
-                # Usually hidden_states[i] is output of layer i (or i-1 depending on norm location).
-                # Let's assume hidden_states[1:] are the layers.
-                
-                layer_idx = self.cfg["layer"]
-                # OpenVLA/Llama structure: hidden_states contains (embeddings, layer_0, ..., layer_N)
-                # So layer_idx 0 (first layer) is at index 1.
-                
-                target_states = output.hidden_states[layer_idx + 1] # (batch, seq, dim)
-                
-                # We might want to filter tokens (e.g., only action tokens, or all tokens)
-                # For now, let's take all tokens.
-                activations = target_states
-                
-                # Verify features
-                if not self.verified_features:
-                    print(f"\n[Feature Verification]")
-                    print(f"Layer: {layer_idx}")
-                    print(f"Shape: {activations.shape}")
-                    print(f"Mean: {activations.float().mean().item():.4f}")
-                    print(f"Std: {activations.float().std().item():.4f}")
-                    print(f"Min: {activations.float().min().item():.4f}")
-                    print(f"Max: {activations.float().max().item():.4f}")
-                    print("-" * 20 + "\n")
-                    self.verified_features = True
-                
-                return activations.reshape(-1, self.cfg["act_size"])
-
-        else:
-            # TransformerLens
-            batch_tokens = batch # Input is tokens
-            with torch.no_grad():
-                _, cache = self.model.run_with_cache(
-                    batch_tokens,
-                    names_filter=[self.hook_point],
-                    stop_at_layer=self.cfg["layer"] + 1,
+    def _get_online_activations(self, batch):
+        with torch.no_grad():
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            pixel_values = batch["pixel_values"].to(torch.bfloat16).to(self.device)
+            labels = batch["labels"].to(self.device) if "labels" in batch else input_ids.clone()
+            proprio = batch["proprio"].to(self.device).to(torch.bfloat16)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output: CausalLMOutputWithPast = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    labels=labels,
+                    output_hidden_states=True,
+                    proprio=proprio,
+                    proprio_projector=self.proprio_projector,
+                    use_film=False,
                 )
-            return cache[self.hook_point]
 
-    def _load_next_file_activations(self):
-        # Only used for .npz files
-        if self.file_idx >= len(self.files):
-            self.file_idx = 0
-            np.random.shuffle(self.files)
-
-        file_path = self.files[self.file_idx]
-        self.file_idx += 1
-
-        try:
-            data = np.load(file_path)
-            # Shape: (batch, layers, tokens, dim)
-
-            # Select layer
             layer_idx = self.cfg["layer"]
-            target_feature_name = self.cfg.get("target_features", "task_hidden_states")
+            item = output.hidden_states[layer_idx + 1]  # (batch, seq, dim)
 
-            hidden_states = data[target_feature_name]
-            # Old format check: (batch, layers, tokens, dim)
-            if hidden_states.ndim == 4:
-                if layer_idx >= hidden_states.shape[1]:
-                    raise ValueError(f"Requested layer {layer_idx} but file only has {hidden_states.shape[1]} layers.")
-                activations = hidden_states[:, layer_idx, :, :]  # (batch, tokens, dim)
+            if self.target_feature == "all":
+                activations = item
             else:
-                # Assume it might be (batch, tokens, dim) if pre-filtered?
-                activations = hidden_states
+                num_patches = (
+                    self.model.vision_backbone.get_num_patches() * self.model.vision_backbone.get_num_images_in_input()
+                )
+                task_states = item[:, :num_patches]
+                text_states = item[:, num_patches:-1]
 
-            # Flatten to (batch*tokens, dim)
-            activations = activations.reshape(-1, activations.shape[-1])
+                if "task" in self.target_feature:
+                    activations = task_states
+                elif "action" in self.target_feature or "text" in self.target_feature:
+                    ground_truth_token_ids = labels[:, 1:].to(self.device)
+                    current_action_mask = get_current_action_mask(ground_truth_token_ids)
+                    next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
+                    action_mask = current_action_mask | next_actions_mask
 
-            return torch.from_numpy(activations).to(self.device, dtype=self.cfg["dtype"])
+                    if "action" in self.target_feature:
+                        activations = text_states[action_mask]
+                    else:  # text
+                        activations = text_states[~action_mask]
+                else:
+                    activations = item
 
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return None
+            if not self.verified_features:
+                self._verify(activations)
 
-    def _fill_buffer(self):
+            return activations.reshape(-1, activations.shape[-1])
+
+    def _fill_online_buffer(self):
         all_activations = []
-        current_size = 0
-        target_size = self.cfg["batch_size"] * self.num_batches_in_buffer  # Heuristic, or use cfg settings
-
-        # For disk loading, we just load files until we have enough
-        if self.is_feature_dataset:
-            if self.is_webdataset:
-                # Consume from stream until we have enough activations
-                while len(all_activations) * self.cfg.get("act_size", 4096) < target_size * 2048: # Estimation
-                    try:
-                        sample = next(self.dataset)
-                        # 'npz' dict is automatically unpacked by datasets if structure matches
-                        # sample is a dict. keys depend on what's in npz.
-                        # If using 'datasets' with 'webdataset' script, sample['npz'] contains data
-                        
-                        data = sample['npz'] if 'npz' in sample else sample
-                        target_feature_name = self.cfg.get("target_features", "task_hidden_states")
-                        
-                        if target_feature_name not in data:
-                            continue
-                            
-                        # data[key] is list of lists (if loaded by datasets) or numpy array
-                        acts = np.array(data[target_feature_name])
-                        
-                        # Shape: (tokens, dim) or (batch, tokens, dim)?
-                        # In my writer: (patches, dim) per record. But record is 1 sample from batch.
-                        # Writer: record["task_hidden_states"] = task_state (numpy)
-                        # So it should be (tokens, dim).
-                        
-                        if acts.ndim == 2:
-                            acts = acts.reshape(-1, acts.shape[-1])
-                        
-                        tensor_acts = torch.from_numpy(acts).to(self.device, dtype=self.cfg["dtype"])
-                        all_activations.append(tensor_acts)
-                        
-                        if len(all_activations) > self.num_batches_in_buffer * 10: # Safety break
-                            break
-                            
-                    except StopIteration:
-                        # Restart iterator
-                        print("Dataset exhausted, restarting iterator.")
-                        from datasets import load_dataset
-                        ds = load_dataset("webdataset", data_files=self.tar_files, split="train", streaming=True)
-                        self.dataset = iter(ds.shuffle(buffer_size=self.cfg.get("shuffle_buffer_size", 1000)))
-                        continue
-            else:
-                while len(all_activations) < self.num_batches_in_buffer:  # Load at least 'num_batches_in_buffer' files
-                    acts = self._load_next_file_activations()
-                    if acts is not None:
-                        all_activations.append(acts)
-        else:
-            if getattr(self, "is_openvla", False):
-                # OpenVLA logic
-                while len(all_activations) * self.cfg.get("act_size", 4096) < target_size: # Approximate check
-                     try:
-                        batch = next(self.vla_iterator)
-                        acts = self.get_activations(batch)
-                        all_activations.append(acts)
-                        
-                        if len(all_activations) * self.cfg.get("act_size", 4096) > target_size:
-                             break
-                     except StopIteration:
-                        print("Dataset iterator exhausted, restarting.")
-                        self.vla_iterator = iter(self.vla_dataloader)
-                        
-            else:
-                for _ in range(self.num_batches_in_buffer):
-                    batch_tokens = self.get_batch_tokens()
-                    activations = self.get_activations(batch_tokens).reshape(-1, self.cfg["act_size"])
-                    all_activations.append(activations)
-
+        target_size = self.cfg["batch_size"] * self.num_batches_in_buffer
+        while len(all_activations) * 1024 < target_size:  # Heuristic
+            try:
+                batch = next(self.vla_iterator)
+                all_activations.append(self._get_online_activations(batch))
+            except StopIteration:
+                self.vla_iterator = iter(self.vla_dataloader)
         return torch.cat(all_activations, dim=0)
 
-    def _get_dataloader(self):
-        return DataLoader(TensorDataset(self.activation_buffer), batch_size=self.cfg["batch_size"], shuffle=True)
+    def _verify(self, activations):
+        print(f"\n[Feature Verification]")
+        print(f"Target: {self.target_feature}")
+        print(f"Shape: {activations.shape}")
+        print(f"Mean: {activations.float().mean().item():.4f}")
+        print(f"Std: {activations.float().std().item():.4f}")
+        print("-" * 20 + "\n")
+        self.verified_features = True
 
     def next_batch(self):
-        try:
-            return next(self.dataloader_iter)[0]
-        except (StopIteration, AttributeError):
-            self.activation_buffer = self._fill_buffer()
-            self.dataloader = self._get_dataloader()
-            self.dataloader_iter = iter(self.dataloader)
-            return next(self.dataloader_iter)[0]
+        if self.is_offline:
+            try:
+                batch_data = next(self.dataloader_iter)
+            except StopIteration:
+                self.dataloader_iter = iter(self.dataloader)
+                batch_data = next(self.dataloader_iter)
+
+            activations = batch_data[self.target_feature].to(self.device, dtype=self.cfg.get("dtype", torch.float32))
+            if activations.ndim == 3:
+                activations = activations.reshape(-1, activations.shape[-1])
+            if not self.verified_features:
+                self._verify(activations)
+            return activations
+        else:
+            try:
+                return next(self.activation_dataloader_iter)[0]
+            except StopIteration:
+                self.activation_buffer = self._fill_online_buffer()
+                self.activation_dataloader = DataLoader(
+                    TensorDataset(self.activation_buffer), batch_size=self.cfg["batch_size"], shuffle=True
+                )
+                self.activation_dataloader_iter = iter(self.activation_dataloader)
+                return next(self.activation_dataloader_iter)[0]

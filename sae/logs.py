@@ -37,6 +37,9 @@ def mean_abl_hook(activation, hook):
 
 @torch.no_grad()
 def log_model_performance(wandb_run, step, model, activations_store, sae, index=None, batch_tokens=None):
+    if not hasattr(model, "run_with_hooks"):
+        return
+
     if batch_tokens is None:
         batch_tokens = activations_store.get_batch_tokens()[: sae.cfg["batch_size"] // sae.cfg["seq_len"]]
     batch = activations_store.get_activations(batch_tokens).reshape(-1, sae.cfg["act_size"])
