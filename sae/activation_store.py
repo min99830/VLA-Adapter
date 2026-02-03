@@ -27,10 +27,11 @@ class ActivationsStore:
         self.device = cfg["device"]
         self.model_batch_size = cfg["model_batch_size"]
         self.num_batches_in_buffer = cfg["num_batches_in_buffer"]
-        self.is_dataset_on_disk = cfg.get("is_dataset_on_disk", False)
+        self.is_feature_dataset = cfg.get("is_feature_dataset", False)
         self.verified_features = False
 
-        if self.is_dataset_on_disk:
+        if self.is_feature_dataset:
+            print("Loading feature dataset from disk...")
             self.dataset_path = cfg["dataset_path"]
             
             # Check for WebDataset (.tar) or original (.npz)
@@ -63,60 +64,49 @@ class ActivationsStore:
                 # np.random.shuffle(self.files)
         else:
             self.model = model
-            if OpenVLAForActionPrediction is not None and isinstance(model, OpenVLAForActionPrediction):
-                self.is_openvla = True
-                print("Initializing ActivationsStore for OpenVLA...")
-                
-                # OpenVLA Dataset Setup
-                processor = AutoProcessor.from_pretrained(cfg["model_name"], trust_remote_code=True)
-                action_tokenizer = ActionTokenizer(processor.tokenizer)
-                
-                batch_transform = RLDSBatchTransform(
-                    action_tokenizer,
-                    processor.tokenizer,
-                    image_transform=processor.image_processor.apply_transform,
-                    prompt_builder_fn=PurePromptBuilder,
-                )
-                
-                # Use dataset path from cfg or default
-                data_root_dir = cfg.get("data_root_dir", "datasets/rlds")
-                dataset_name = cfg.get("dataset_name", "libero_spatial_no_noops")
-                
-                print(f"Loading RLDS dataset: {dataset_name} from {data_root_dir}")
-                dataset = RLDSDataset(
-                    data_root_dir,
-                    dataset_name,
-                    batch_transform,
-                    resize_resolution=(224, 224), # Standard OpenVLA resolution
-                    shuffle_buffer_size=cfg.get("shuffle_buffer_size", 1000),
-                    image_aug=False,
-                )
+            self.is_openvla = True
+            print("Initializing ActivationsStore for OpenVLA...")
+            
+            # OpenVLA Dataset Setup
+            processor = AutoProcessor.from_pretrained(cfg["model_name"], trust_remote_code=True)
+            action_tokenizer = ActionTokenizer(processor.tokenizer)
+            
+            batch_transform = RLDSBatchTransform(
+                action_tokenizer,
+                processor.tokenizer,
+                image_transform=processor.image_processor.apply_transform,
+                prompt_builder_fn=PurePromptBuilder,
+            )
+            
+            # Use dataset path from cfg or default
+            data_root_dir = cfg.get("data_root_dir", "datasets/rlds")
+            dataset_name = cfg.get("dataset_name", "libero_spatial_no_noops")
+            
+            print(f"Loading RLDS dataset: {dataset_name} from {data_root_dir}")
+            dataset = RLDSDataset(
+                data_root_dir,
+                dataset_name,
+                batch_transform,
+                resize_resolution=(224, 224), # Standard OpenVLA resolution
+                shuffle_buffer_size=cfg.get("shuffle_buffer_size", 1000),
+                image_aug=False,
+            )
 
-                collator = PaddedCollatorForActionPrediction(
-                    processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
-                )
-                
-                self.vla_dataloader = DataLoader(
-                    dataset,
-                    batch_size=self.model_batch_size,
-                    sampler=None,
-                    collate_fn=collator,
-                    num_workers=4,
-                    prefetch_factor=2,
-                    pin_memory=True,
-                )
-                self.vla_iterator = iter(self.vla_dataloader)
-                self.hook_point = f"layers.{cfg['layer']}" # Placeholder, actual access via hidden_states
-                
-            else:
-                self.is_openvla = False
-                from datasets import load_dataset
-
-                self.dataset = iter(load_dataset(cfg["dataset_path"], split="train", streaming=True))
-                self.hook_point = cfg["hook_point"]
-                self.context_size = min(cfg["seq_len"], model.cfg.n_ctx)
-                self.tokens_column = self._get_tokens_column()
-                self.tokenizer = model.tokenizer
+            collator = PaddedCollatorForActionPrediction(
+                processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
+            )
+            
+            self.vla_dataloader = DataLoader(
+                dataset,
+                batch_size=self.model_batch_size,
+                sampler=None,
+                collate_fn=collator,
+                num_workers=4,
+                prefetch_factor=2,
+                pin_memory=True,
+            )
+            self.vla_iterator = iter(self.vla_dataloader)
+            self.hook_point = f"layers.{cfg['layer']}" # Placeholder, actual access via hidden_states
 
         self.activation_buffer = self._fill_buffer()
         self.dataloader = self._get_dataloader()
@@ -124,7 +114,7 @@ class ActivationsStore:
 
     def _get_tokens_column(self):
         # Only relevant for text dataset
-        if self.is_dataset_on_disk:
+        if self.is_feature_dataset:
             return None 
             
         sample = next(self.dataset)
@@ -155,7 +145,7 @@ class ActivationsStore:
         return token_tensor.view(self.model_batch_size, self.context_size)
 
     def get_activations(self, batch):
-        if self.is_dataset_on_disk:
+        if self.is_feature_dataset:
              raise NotImplementedError("Use _load_next_file_activations for disk datasets")
              
         if getattr(self, "is_openvla", False):
@@ -259,7 +249,7 @@ class ActivationsStore:
         target_size = self.cfg["batch_size"] * self.num_batches_in_buffer  # Heuristic, or use cfg settings
 
         # For disk loading, we just load files until we have enough
-        if self.is_dataset_on_disk:
+        if self.is_feature_dataset:
             if self.is_webdataset:
                 # Consume from stream until we have enough activations
                 while len(all_activations) * self.cfg.get("act_size", 4096) < target_size * 2048: # Estimation

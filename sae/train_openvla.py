@@ -30,21 +30,21 @@ def train():
 
     # Config
     cfg = get_default_cfg()
-    
+
     # Overrides for OpenVLA SAE training
     cfg["model_name"] = "./pretrained_models/LIBERO-Spatial-Pro"
-    cfg["is_dataset_on_disk"] = False # Use online feature extraction
-    
+    cfg["is_feature_dataset"] = False # Use online feature extraction
+
     # Dataset config (Adjust these paths as per your environment)
-    cfg["data_root_dir"] = "datasets/rlds" 
-    cfg["dataset_name"] = "libero_spatial_no_noops" 
-    
-    cfg["layer"] = 12 
+    cfg["data_root_dir"] = "./data/libero"
+    cfg["dataset_name"] = "libero_spatial_no_noops"
+
+    cfg["layer"] = 12
     cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg["sae_type"] = "topk" 
+    cfg["sae_type"] = "topk"
     cfg["batch_size"] = 4096 # SAE batch size
     cfg["model_batch_size"] = 4 # OpenVLA batch size (adjust based on VRAM)
-    
+
     print(f"Loading OpenVLA model from {cfg['model_name']}...")
     try:
         model = AutoModelForVision2Seq.from_pretrained(
@@ -60,7 +60,7 @@ def train():
 
     print(f"Initializing SAE training for layer {cfg['layer']}...")
     print(f"Dataset: {cfg['dataset_name']} at {cfg['data_root_dir']}")
-    
+
     # SAE Init
     if cfg["sae_type"] == "vanilla":
         sae = VanillaSAE(cfg)
@@ -78,12 +78,7 @@ def train():
     # Activation Store
     print("Initializing ActivationsStore...")
     # This will trigger the OpenVLA dataset loading logic we added to activation_store.py
-    try:
-        activations_store = ActivationsStore(model, cfg)
-    except Exception as e:
-        print(f"Failed to initialize ActivationsStore: {e}")
-        print("Please ensure your RLDS datasets are correctly placed in 'datasets/rlds' or update cfg['data_root_dir'].")
-        return
+    activations_store = ActivationsStore(model, cfg)
 
     # Train
     print("Starting training...")

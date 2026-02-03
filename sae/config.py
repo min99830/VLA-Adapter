@@ -26,8 +26,8 @@ def get_default_cfg():
         "device": "cuda:0",
         "model_batch_size": 8,
         "num_batches_in_buffer": 10,
-        "dataset_path": "runs/EXTRACT+LIBERO-Spatial-Pro+libero_spatial_no_noops--2026_01_27-17_45_43/features",
-        "is_dataset_on_disk": True,
+        "dataset_path": "path/to/feature",
+        "is_feature_dataset": True,
         "wandb_project": "sparse_autoencoders",
         "input_unit_norm": True,
         "perf_log_freq": 1000,
@@ -46,7 +46,7 @@ def get_default_cfg():
 
 
 def post_init_cfg(cfg):
-    if not cfg.get("is_dataset_on_disk", False):
+    if not cfg.get("is_feature_dataset", False):
         cfg["hook_point"] = get_act_name(cfg["site"], cfg["layer"])
     else:
         cfg["hook_point"] = f"layer_{cfg['layer']}"
