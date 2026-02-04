@@ -21,10 +21,6 @@ from sae.training import train_sae
 
 # Import OpenVLA classes and setup patching for ONLINE mode
 try:
-    import prismatic.extern.hf.modeling_prismatic as modeling_prismatic
-
-    # Pre-patching modules to fix cumsum error in newer PyTorch
-    import prismatic.training.train_utils as train_utils
     from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
     from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
     from prismatic.extern.hf.processing_prismatic import (
@@ -84,9 +80,38 @@ def load_vla_adapter(cfg) -> tuple[OpenVLAForActionPrediction, ProprioProjector]
 
     return model, proprio_projector
 
+def get_arguments():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Grid Search for SAE Hyperparameters")
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=32,
+    )
+    parser.add_argument(
+        "--expansion_factor",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--target_feature",
+        type=str,
+        default="text",
+    )
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=12,
+    )
+    args = parser.parse_args()
+    return args
+
 
 def run_actual_train():
     cfg = get_default_cfg()
+    
+    args = get_arguments()
 
     # --- Mode Toggle ---
     cfg["is_offline"] = False
@@ -96,17 +121,19 @@ def run_actual_train():
     # cfg["dataset_path"] = "runs/EXTRACT+LIBERO-Spatial-Pro+libero_spatial_no_noops--2026_01_27-17_45_43/features"
     cfg["data_root_dir"] = "data/libero"
     cfg["dataset_name"] = "libero_spatial_no_noops"
-    cfg["target_feature"] = "text"
-    cfg["layer"] = 12
+    cfg["target_feature"] = args.target_feature
+    cfg["layer"] = args.layer
     cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
     cfg["batch_size"] = 4096
     cfg["model_batch_size"] = 8
     cfg["sae_type"] = "topk"
-    cfg["top_k"] = 64
+    cfg["top_k"] = args.topk
     cfg["act_size"] = 896
-    cfg["dict_size"] = 896 * 4
+    cfg["dict_size"] = 896 * args.expansion_factor
     cfg["num_tokens"] = int(1e8)
     cfg["num_images_in_input"] = 2
+    
+    cfg["name"] = f"VLA-adapter_{cfg['sae_type']}_layer{cfg['layer']}_feat{cfg['target_feature']}_topk{cfg['top_k']}_exp{args.expansion_factor}"
 
     print(f"Starting OpenVLA SAE training (Mode: {'OFFLINE' if cfg['is_offline'] else 'ONLINE'})...")
     print(f"Target Feature: {cfg['target_feature']} at Layer {cfg['layer']}")
